@@ -69,13 +69,21 @@ static bool scroll_haptic = false;
 module_param(scroll_haptic, bool, 0644);
 MODULE_PARM_DESC(scroll_haptic, "Enable haptic feedback detents while scrolling");
 
-static unsigned int scroll_haptic_intensity = 0x05;
+static unsigned int scroll_haptic_intensity = 0x08;
 module_param(scroll_haptic_intensity, uint, 0644);
-MODULE_PARM_DESC(scroll_haptic_intensity, "Scroll haptic pulse intensity (0x01=faintest, 0x20=strong, default 0x05)");
+MODULE_PARM_DESC(scroll_haptic_intensity, "Scroll haptic pulse intensity (0x01=faintest, 0x20=strong, default 0x08)");
 
-static unsigned int scroll_haptic_distance = 200;
+static unsigned int scroll_haptic_b6 = 0x01;
+module_param(scroll_haptic_b6, uint, 0644);
+MODULE_PARM_DESC(scroll_haptic_b6, "Scroll haptic sharpness/attack (0x00=soft, 0x06=sharp, default 0x01)");
+
+static unsigned int scroll_haptic_b11 = 0x01;
+module_param(scroll_haptic_b11, uint, 0644);
+MODULE_PARM_DESC(scroll_haptic_b11, "Scroll haptic sustain (0x00=short, 0x06=long, default 0x01)");
+
+static unsigned int scroll_haptic_distance = 150;
 module_param(scroll_haptic_distance, uint, 0644);
-MODULE_PARM_DESC(scroll_haptic_distance, "Y-axis distance between scroll haptic detents (default 200)");
+MODULE_PARM_DESC(scroll_haptic_distance, "Y-axis units between scroll haptic detents (~44 units/mm, default 150 ~= 3.4mm)");
 
 #define TRACKPAD2_2021_BT_VERSION 0x110
 #define TRACKPAD_2024_BT_VERSION 0x314
@@ -294,29 +302,14 @@ static void magicmouse_emit_touch(struct magicmouse_sc *msc, int raw_id, u8 *tda
 	msc->touches[id].y = y;
 	msc->touches[id].size = size;
 
-	/* Scroll haptic detents for trackpad 2 */
-	if (scroll_haptic && msc->vib_scroll &&
-	    (input->id.product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD2 ||
-	     input->id.product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD2_USBC)) {
-		if (down && id < 16) {
+	/* Update scroll haptic tracking state per-touch */
+	if (scroll_haptic && id < 16) {
+		if (down) {
 			if (!msc->scroll_haptic_tracking[id]) {
-				/* New touch: initialize tracking */
 				msc->scroll_haptic_y[id] = y;
 				msc->scroll_haptic_tracking[id] = true;
-			} else {
-				int delta = y - msc->scroll_haptic_y[id];
-				int dist = (int)scroll_haptic_distance;
-				if (delta > dist || delta < -dist) {
-					/* Fire scroll haptic pulse */
-					if (msc->hdev->vendor == BT_VENDOR_ID_APPLE)
-						hid_hw_output_report(msc->hdev,
-							msc->vib_scroll, 15);
-					/* Snap to next detent boundary */
-					msc->scroll_haptic_y[id] +=
-						(delta > 0) ? dist : -dist;
-				}
 			}
-		} else if (!down && id < 16) {
+		} else {
 			msc->scroll_haptic_tracking[id] = false;
 		}
 	}
@@ -610,6 +603,33 @@ static int magicmouse_raw_event(struct hid_device *hdev,
 			usb_submit_urb(urb, GFP_KERNEL);
 		}
 		clicks_prev = clicks;
+	}
+
+	/* Scroll haptic detents: fire a light haptic pulse when 2+ fingers
+	 * are scrolling and the average Y movement crosses a detent threshold.
+	 * Only fires when not clicking (to avoid interfering with click haptics).
+	 */
+	if (scroll_haptic && msc->vib_scroll && msc->ntouches >= 2 &&
+	    !(clicks & 1) &&
+	    (data[0] == TRACKPAD2_BT_REPORT_ID ||
+	     data[0] == TRACKPAD2_USB_REPORT_ID)) {
+		/* Use the first tracked finger's Y delta for detent detection */
+		for (ii = 0; ii < npoints; ii++) {
+			int tid = msc->tracking_ids[ii];
+			if (tid < 16 && msc->scroll_haptic_tracking[tid]) {
+				int cur_y = msc->touches[tid].y;
+				int delta = cur_y - msc->scroll_haptic_y[tid];
+				int dist = (int)scroll_haptic_distance;
+				if (delta > dist || delta < -dist) {
+					if (hdev->vendor == BT_VENDOR_ID_APPLE)
+						hid_hw_output_report(hdev,
+							msc->vib_scroll, 15);
+					msc->scroll_haptic_y[tid] +=
+						(delta > 0) ? dist : -dist;
+				}
+				break; /* only check first finger */
+			}
+		}
 	}
 
 	if (input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE ||
@@ -927,8 +947,10 @@ static int magicmouse_enable_hostclick(struct hid_device *hdev)
 	vib_up[6] = (u8)(button_up_param >> 8);
 	vib_up[11] = (u8)(button_up_param >> 0);
 
-	/* Apply scroll haptic intensity parameter */
+	/* Apply scroll haptic parameters */
 	vib_scroll[3] = (u8)(scroll_haptic_intensity & 0xFF);
+	vib_scroll[6] = (u8)(scroll_haptic_b6 & 0xFF);
+	vib_scroll[11] = (u8)(scroll_haptic_b11 & 0xFF);
 
 	if (hdev->vendor == BT_VENDOR_ID_APPLE) {
 		feature_size = sizeof(feature);
