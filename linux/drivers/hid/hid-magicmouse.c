@@ -65,6 +65,18 @@ static unsigned int button_up_param = 0x26140000;
 module_param(button_up_param, uint, 0644);
 MODULE_PARM_DESC(button_up_param, "pressure when button_up and how to vibration");
 
+static bool scroll_haptic = false;
+module_param(scroll_haptic, bool, 0644);
+MODULE_PARM_DESC(scroll_haptic, "Enable haptic feedback detents while scrolling");
+
+static unsigned int scroll_haptic_intensity = 0x05;
+module_param(scroll_haptic_intensity, uint, 0644);
+MODULE_PARM_DESC(scroll_haptic_intensity, "Scroll haptic pulse intensity (0x01=faintest, 0x20=strong, default 0x05)");
+
+static unsigned int scroll_haptic_distance = 200;
+module_param(scroll_haptic_distance, uint, 0644);
+MODULE_PARM_DESC(scroll_haptic_distance, "Y-axis distance between scroll haptic detents (default 200)");
+
 #define TRACKPAD2_2021_BT_VERSION 0x110
 #define TRACKPAD_2024_BT_VERSION 0x314
 
@@ -167,6 +179,9 @@ struct magicmouse_sc {
 	struct delayed_work work;
 	u8 *vib_down;
 	u8 *vib_up;
+	u8 *vib_scroll;
+	int scroll_haptic_y[16]; /* last haptic-fired Y position per touch id */
+	bool scroll_haptic_tracking[16]; /* whether we're tracking this touch */
 	struct timer_list battery_timer;
 };
 
@@ -278,6 +293,33 @@ static void magicmouse_emit_touch(struct magicmouse_sc *msc, int raw_id, u8 *tda
 	msc->touches[id].x = x;
 	msc->touches[id].y = y;
 	msc->touches[id].size = size;
+
+	/* Scroll haptic detents for trackpad 2 */
+	if (scroll_haptic && msc->vib_scroll &&
+	    (input->id.product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD2 ||
+	     input->id.product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD2_USBC)) {
+		if (down && id < 16) {
+			if (!msc->scroll_haptic_tracking[id]) {
+				/* New touch: initialize tracking */
+				msc->scroll_haptic_y[id] = y;
+				msc->scroll_haptic_tracking[id] = true;
+			} else {
+				int delta = y - msc->scroll_haptic_y[id];
+				int dist = (int)scroll_haptic_distance;
+				if (delta > dist || delta < -dist) {
+					/* Fire scroll haptic pulse */
+					if (msc->hdev->vendor == BT_VENDOR_ID_APPLE)
+						hid_hw_output_report(msc->hdev,
+							msc->vib_scroll, 15);
+					/* Snap to next detent boundary */
+					msc->scroll_haptic_y[id] +=
+						(delta > 0) ? dist : -dist;
+				}
+			}
+		} else if (!down && id < 16) {
+			msc->scroll_haptic_tracking[id] = false;
+		}
+	}
 
 	/* If requested, emulate a scroll wheel by detecting small
 	 * vertical touch motions.
@@ -862,6 +904,8 @@ static int magicmouse_enable_hostclick(struct hid_device *hdev)
 	u8 feature[] = { 0xF2, 0x21, 0x01 };
 	u8 vib_down[] = { 0xF2, 0x53, 0x01, 0x17, 0x78, 0x02, 0x06, 0x24, 0x30, 0x06, 0x01, 0x06, 0x18, 0x48, 0x12 };
 	u8 vib_up[] = { 0xF2, 0x53, 0x01, 0x14, 0x78, 0x02, 0x00, 0x24, 0x30, 0x06, 0x01, 0x00, 0x18, 0x48, 0x12 };
+	/* Scroll haptic: light short pulse, B6=0x00 B11=0x00 for minimal sustain */
+	u8 vib_scroll[] = { 0xF2, 0x53, 0x01, 0x05, 0x78, 0x02, 0x00, 0x24, 0x30, 0x06, 0x01, 0x00, 0x18, 0x48, 0x12 };
 	u8 *buf;
 	int ret;
 	int feature_size;
@@ -883,6 +927,9 @@ static int magicmouse_enable_hostclick(struct hid_device *hdev)
 	vib_up[6] = (u8)(button_up_param >> 8);
 	vib_up[11] = (u8)(button_up_param >> 0);
 
+	/* Apply scroll haptic intensity parameter */
+	vib_scroll[3] = (u8)(scroll_haptic_intensity & 0xFF);
+
 	if (hdev->vendor == BT_VENDOR_ID_APPLE) {
 		feature_size = sizeof(feature);
 		buf = kmemdup(feature, feature_size, GFP_KERNEL);
@@ -893,7 +940,8 @@ static int magicmouse_enable_hostclick(struct hid_device *hdev)
 		kfree(buf);
 		msc->vib_down = kmemdup(vib_down, 15, GFP_KERNEL);
 		msc->vib_up = kmemdup(vib_up, 15, GFP_KERNEL);
-		if (!msc->vib_down || !msc->vib_up)
+		msc->vib_scroll = kmemdup(vib_scroll, 15, GFP_KERNEL);
+		if (!msc->vib_down || !msc->vib_up || !msc->vib_scroll)
 			return -ENOMEM;
 	} else { /* USB_VENDOR_ID_APPLE */
 		udev = hid_to_usb_dev(hdev);
@@ -906,7 +954,8 @@ static int magicmouse_enable_hostclick(struct hid_device *hdev)
 		kfree(buf);
 		msc->vib_down = kmemdup(vib_down + 1, 14, GFP_KERNEL);
 		msc->vib_up = kmemdup(vib_up + 1, 14, GFP_KERNEL);
-		if (!msc->vib_down || !msc->vib_up)
+		msc->vib_scroll = kmemdup(vib_scroll + 1, 14, GFP_KERNEL);
+		if (!msc->vib_down || !msc->vib_up || !msc->vib_scroll)
 			return -ENOMEM;
 	}
 
@@ -1109,6 +1158,8 @@ static void magicmouse_remove(struct hid_device *hdev)
 			kfree(msc->vib_down);
 		if (msc->vib_up)
 			kfree(msc->vib_up);
+		if (msc->vib_scroll)
+			kfree(msc->vib_scroll);
 		if (is_usb_magicmouse2(hdev->vendor, hdev->product) ||
 		    is_usb_magictrackpad2(hdev->vendor, hdev->product))
 			timer_delete_sync(&msc->battery_timer);
