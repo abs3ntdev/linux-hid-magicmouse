@@ -610,7 +610,7 @@ static int magicmouse_raw_event(struct hid_device *hdev,
 	 * Suppressed during clicks and pinch-to-zoom (fingers moving in
 	 * opposite Y directions).
 	 */
-	if (scroll_haptic && msc->vib_scroll && msc->ntouches >= 2 &&
+	if (scroll_haptic && msc->vib_scroll && msc->ntouches == 2 &&
 	    !(clicks & 1) &&
 	    (data[0] == TRACKPAD2_BT_REPORT_ID ||
 	     data[0] == TRACKPAD2_USB_REPORT_ID)) {
