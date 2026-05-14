@@ -606,28 +606,48 @@ static int magicmouse_raw_event(struct hid_device *hdev,
 	}
 
 	/* Scroll haptic detents: fire a light haptic pulse when 2+ fingers
-	 * are scrolling and the average Y movement crosses a detent threshold.
-	 * Only fires when not clicking (to avoid interfering with click haptics).
+	 * are scrolling and the Y movement crosses a detent threshold.
+	 * Suppressed during clicks and pinch-to-zoom (fingers moving in
+	 * opposite Y directions).
 	 */
 	if (scroll_haptic && msc->vib_scroll && msc->ntouches >= 2 &&
 	    !(clicks & 1) &&
 	    (data[0] == TRACKPAD2_BT_REPORT_ID ||
 	     data[0] == TRACKPAD2_USB_REPORT_ID)) {
-		/* Use the first tracked finger's Y delta for detent detection */
-		for (ii = 0; ii < npoints; ii++) {
+		int first_dy = 0, second_dy = 0;
+		int first_tid = -1, found = 0;
+
+		/* Find the Y deltas of the first two tracked fingers */
+		for (ii = 0; ii < npoints && found < 2; ii++) {
 			int tid = msc->tracking_ids[ii];
 			if (tid < 16 && msc->scroll_haptic_tracking[tid]) {
-				int cur_y = msc->touches[tid].y;
-				int delta = cur_y - msc->scroll_haptic_y[tid];
-				int dist = (int)scroll_haptic_distance;
-				if (delta > dist || delta < -dist) {
-					if (hdev->vendor == BT_VENDOR_ID_APPLE)
-						hid_hw_output_report(hdev,
-							msc->vib_scroll, 15);
-					msc->scroll_haptic_y[tid] +=
-						(delta > 0) ? dist : -dist;
+				int dy = msc->touches[tid].y -
+					 msc->scroll_haptic_y[tid];
+				if (found == 0) {
+					first_dy = dy;
+					first_tid = tid;
+				} else {
+					second_dy = dy;
 				}
-				break; /* only check first finger */
+				found++;
+			}
+		}
+
+		/* Only fire if both fingers are moving in the same Y direction
+		 * (scrolling), not opposite directions (pinch-to-zoom).
+		 * Allow if either delta is near zero (one finger stationary).
+		 */
+		if (found >= 2 && first_tid >= 0 &&
+		    (first_dy * second_dy >= 0 ||
+		     abs(first_dy) < 20 || abs(second_dy) < 20)) {
+			int delta = first_dy;
+			int dist = (int)scroll_haptic_distance;
+			if (delta > dist || delta < -dist) {
+				if (hdev->vendor == BT_VENDOR_ID_APPLE)
+					hid_hw_output_report(hdev,
+						msc->vib_scroll, 15);
+				msc->scroll_haptic_y[first_tid] +=
+					(delta > 0) ? dist : -dist;
 			}
 		}
 	}
